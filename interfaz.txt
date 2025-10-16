@@ -1,0 +1,385 @@
+# hub.py — Interfaz + Proxy cámara + Grabación a JPGs (sin dependencias externas)
+from flask import Flask, request, jsonify, Response, stream_with_context
+import os, time, json, threading
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
+
+app = Flask(__name__)
+
+# ===== Estado de sensores =====
+LATEST = {
+    "temp": None,
+    "humidity": None,
+    "pressure": None,
+    "mag_raw": None,
+    "mag_state": None,
+    "ts": 0,
+}
+
+# ===== Cámara / Proxy =====
+CAM_URL = None
+TIMEOUT = 10  # s
+
+# ===== Grabación =====
+REC = {
+    "active": False,
+    "dir": None,
+    "frames": 0,
+    "start_ts": 0.0,
+    "thread": None,
+    "stop_flag": False,
+    "error": None,
+}
+
+HTML = r"""<!doctype html><html lang="es">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CENTRO DE MONITOREO</title>
+<style>
+:root{--bg:#1e2227;--panel:#2b323a;--panel2:#23292f;--fg:#e8eaed;--muted:#9aa0a6;--ok:#22c55e;--bad:#ef4444;--accent:#ff3b30;--cel1:#63d2ff;--cel2:#2fb0ff;--cel3:#16b1f0}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Arial}
+.header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,rgba(22,27,32,.9),rgba(22,27,32,.65));border-bottom:1px solid #33404a;padding:18px 20px;margin:0 0 14px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.title{margin:0;line-height:1;font-weight:900;letter-spacing:.12em;text-transform:uppercase;font-size:clamp(18px,3.2vw,28px);
+background:linear-gradient(90deg,var(--cel1),var(--cel2) 50%,var(--cel3));-webkit-background-clip:text;background-clip:text;color:transparent;text-shadow:0 0 14px rgba(55,196,255,.25),0 0 4px rgba(55,196,255,.35)}
+.subtitle{margin:8px 0 0;font-size:12px;color:#9fb6c6;letter-spacing:.18em;text-transform:uppercase}
+.app{display:grid;grid-template-columns:340px 1fr;gap:18px;padding:0 18px 18px}
+.left{display:flex;flex-direction:column;gap:16px}
+.card{background:linear-gradient(#2b323a,#272e35);border:1px solid #3a424a;border-radius:16px;padding:16px;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+.card h3{margin:0 0 6px;font-size:14px;font-weight:700;letter-spacing:.04em;color:#cfd3d7}
+.val{font-size:24px;font-weight:800}.unit{margin-left:6px;font-size:12px;color:var(--muted)}
+.kpi{display:flex;align-items:center;justify-content:space-between}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;background:#1d2329;border:1px solid #3a424a;color:#cfd3d7;font-size:12px;font-weight:600}
+.pill.ok{background:#082414;border-color:#1f8f47;color:#a7efbf}.pill.bad{background:#2a1414;border-color:#743333;color:#ffc5c5}
+.input{width:100%;background:#1a1f24;border:1px solid #3a424a;color:var(--fg);border-radius:10px;padding:10px 12px}
+.btn{cursor:pointer;background:#1a1f24;border:1px solid #3a424a;color:#fff;border-radius:10px;padding:10px 12px}
+.btn:hover{filter:brightness(1.05)}
+.right{background:var(--panel2);border:1px solid #3a424a;border-radius:18px;padding:14px;min-height:70vh}
+.viewer{position:relative;height:100%;border-radius:12px;background:#000;overflow:hidden}
+.viewer img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.small{font-size:12px;color:var(--muted)}
+.grid-overlay{position:absolute;inset:0;pointer-events:none;background:
+linear-gradient(to right,transparent calc(33.333% - 1px),var(--accent) calc(33.333% - 1px),var(--accent) calc(33.333% + 1px),transparent calc(33.333% + 1px)),
+linear-gradient(to right,transparent calc(66.666% - 1px),var(--accent) calc(66.666% - 1px),var(--accent) calc(66.666% + 1px),transparent calc(66.666% + 1px)),
+linear-gradient(to bottom,transparent calc(33.333% - 1px),var(--accent) calc(33.333% - 1px),var(--accent) calc(33.333% + 1px),transparent calc(33.333% + 1px)),
+linear-gradient(to bottom,transparent calc(66.666% - 1px),var(--accent) calc(66.666% - 1px),var(--accent) calc(66.666% + 1px),transparent calc(66.666% + 1px))}
+.cross{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}
+.cross::before,.cross::after{content:"";display:block;background:var(--accent);border-radius:2px}
+.cross::before{width:22%;height:4px}.cross::after{width:4px;height:22%}
+@media(max-width:980px){.app{grid-template-columns:1fr}}
+@keyframes bump{0%{transform:scale(1)}30%{transform:scale(1.06)}100%{transform:scale(1)}}.val.bump{animation:bump .35s ease}
+</style>
+</head>
+<body>
+<header class="header">
+  <h1 class="title">CENTRO DE MONITOREO</h1>
+  <div class="subtitle">ESP32-CAM • Sensores en tiempo real</div>
+</header>
+
+<div class="app">
+  <div class="left">
+
+    <div class="card">
+      <h3>ESTADO</h3>
+      <div id="status" class="pill bad">Sin conexión al servidor</div>
+      <div class="small" style="margin-top:6px">Última actualización: <span id="last">—</span></div>
+    </div>
+
+    <div class="card"><h3>TEMPERATURA</h3><div class="kpi"><div class="val" id="temp">—</div><div class="unit">°C</div></div></div>
+    <div class="card"><h3>HUMEDAD</h3><div class="kpi"><div class="val" id="hum">—</div><div class="unit">%RH</div></div></div>
+    <div class="card"><h3>ATMÓSFERA</h3><div class="kpi"><div class="val" id="atm">—</div><div class="unit">hPa</div></div></div>
+
+    <div class="card">
+      <h3>MAGNETISMO (KY-024)</h3>
+      <div class="kpi"><div class="val" id="mag">—</div><div class="unit">raw</div></div>
+      <div class="small" id="magstate">Umbral: —</div>
+    </div>
+
+    <div class="card">
+      <h3>CÁMARA</h3>
+      <div class="row">
+        <input id="camIp" class="input" placeholder="IP de la cámara (ej. 192.168.1.60)">
+        <button class="btn" id="btnCam">Conectar</button>
+      </div>
+      <div class="small" style="margin-top:6px">La UI usará proxy interno: /cam.stream (fallback /cam.jpg)</div>
+    </div>
+
+    <div class="card">
+      <h3>GRABACIÓN</h3>
+      <div class="row">
+        <button class="btn" id="recStart">Grabar</button>
+        <button class="btn" id="recStop">Detener</button>
+      </div>
+      <div class="small" id="recInfo" style="margin-top:8px">Estado: inactivo</div>
+    </div>
+
+  </div>
+
+  <div class="right">
+    <div class="viewer">
+      <img id="img" alt="ESP32-CAM stream">
+      <div class="grid-overlay"></div>
+      <div class="cross"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const sts=document.getElementById('status'), last=document.getElementById('last');
+  const tEl=document.getElementById('temp'), hEl=document.getElementById('hum'), pEl=document.getElementById('atm');
+  const mEl=document.getElementById('mag'), msEl=document.getElementById('magstate');
+  const img=document.getElementById('img'), ipIn=document.getElementById('camIp');
+  const btnCam=document.getElementById('btnCam');
+  const recInfo=document.getElementById('recInfo');
+  const recStart=document.getElementById('recStart');
+  const recStop=document.getElementById('recStop');
+
+  let lastOkUnix=0, prevT=null, prevH=null, prevP=null, prevM=null;
+
+  function setStatus(ok){ if(ok){sts.textContent="Conectado";sts.classList.remove('bad');sts.classList.add('ok');} else {sts.textContent="Sin conexión al servidor";sts.classList.remove('ok');sts.classList.add('bad');} }
+  function bump(el){ el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump'); }
+
+  async function setCamHost(host){
+    await fetch('/set_cam',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host})});
+  }
+
+  async function connectCam(){
+    const host=(ipIn.value||'').trim(); if(!host) return;
+    try{ await setCamHost(host); }catch(e){}
+    if(window._snapPoll){ clearInterval(window._snapPoll); window._snapPoll=null; }
+    img.onerror=()=>{
+      if(window._snapPoll) return;
+      window._snapPoll=setInterval(()=>{ img.src='/cam.jpg?t='+Date.now(); }, 700);
+    };
+    img.src='/cam.stream';
+  }
+
+  async function pull(){
+    try{
+      const r=await fetch('/metrics.json?t='+Date.now(),{cache:'no-store'});
+      if(!r.ok) throw new Error(r.status);
+      const j=await r.json(), now=new Date();
+      last.textContent=now.toLocaleTimeString(); lastOkUnix=Math.floor(now.getTime()/1000);
+
+      if(j.temp!=null){const v=Number(j.temp); tEl.textContent=v.toFixed(1); if(prevT===null||Math.abs(v-prevT)>0.01) bump(tEl); prevT=v;} else tEl.textContent='—';
+      if(j.humidity!=null){const v=Number(j.humidity); hEl.textContent=v.toFixed(1); if(prevH===null||Math.abs(v-prevH)>0.01) bump(hEl); prevH=v;} else hEl.textContent='—';
+      if(j.pressure!=null){const v=Number(j.pressure); pEl.textContent=v.toFixed(1); if(prevP===null||Math.abs(v-prevP)>0.05) bump(pEl); prevP=v;} else pEl.textContent='—';
+      if(j.mag_raw!=null){const v=Number(j.mag_raw); mEl.textContent=v.toFixed(0); if(prevM===null||Math.abs(v-prevM)>=1) bump(mEl); prevM=v; msEl.textContent='Umbral: '+(j.mag_state?'ACTIVO':'inactivo');}
+      else{ mEl.textContent='—'; msEl.textContent='Umbral: —'; }
+    }catch(_){}
+    finally{
+      const now=Math.floor(Date.now()/1000);
+      setStatus((now-lastOkUnix)<=8);
+      setTimeout(pull,1000);
+    }
+  }
+
+  async function refreshRec(){
+    try{
+      const r=await fetch('/record/status'); const j=await r.json();
+      recInfo.textContent = 'Estado: ' + (j.active ? ('grabando — ' + (j.fps||0)+' fps — '+(j.frames||0)+' frames — '+(j.dir||'')) : 'inactivo');
+    }catch(e){
+      recInfo.textContent = 'Estado: desconocido';
+    }
+  }
+
+  recStart.addEventListener('click', async()=>{
+    await fetch('/record/start', {method:'POST'});
+    await refreshRec();
+  });
+  recStop.addEventListener('click', async()=>{
+    await fetch('/record/stop', {method:'POST'});
+    await refreshRec();
+  });
+
+  btnCam.addEventListener('click', connectCam);
+  setInterval(refreshRec, 1000);
+
+  pull(); // arranca polling de métricas
+})();
+</script>
+</body></html>
+"""
+
+# ---------- Utilidades ----------
+def now_dir():
+    return time.strftime("%Y%m%d_%H%M%S")
+
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+    return p
+
+# ---------- Interfaz ----------
+@app.get("/")
+def ui_root():
+    return Response(HTML, mimetype="text/html")
+
+# ---------- Métricas ----------
+@app.get("/metrics.json")
+def metrics_json():
+    return jsonify(LATEST)
+
+@app.post("/ingest")
+def ingest():
+    try:
+        if request.is_json:
+            data = request.get_json(force=True)
+        else:
+            raw = request.data.decode("utf-8", "ignore")
+            data = json.loads(raw) if raw else {}
+    except Exception as e:
+        return jsonify(ok=False, err=f"bad json: {e}"), 400
+
+    for k in ("temp","humidity","pressure","mag_raw","mag_state"):
+        if k in data:
+            LATEST[k] = data[k]
+    LATEST["ts"] = int(time.time())
+    return jsonify(ok=True)
+
+# ---------- Cámara: configurar IP ----------
+@app.post("/set_cam")
+def set_cam():
+    global CAM_URL
+    try:
+        host = (request.get_json(force=True) or {}).get("host","").strip()
+    except:
+        host = ""
+    if not host:
+        return jsonify(ok=False, err="host vacío"), 400
+    CAM_URL = host if host.startswith("http") else ("http://" + host)
+    return jsonify(ok=True, cam=CAM_URL)
+
+# ---------- Proxy: snapshot ----------
+@app.get("/cam.jpg")
+def cam_jpg():
+    if not CAM_URL:
+        return ("cam no configurada", 400)
+    url = CAM_URL.rstrip("/") + "/jpg"
+    try:
+        req = Request(url, headers={"User-Agent":"Mozilla/5.0"})
+        with urlopen(req, timeout=TIMEOUT) as r:
+            data = r.read()
+        return Response(data, mimetype="image/jpeg",
+                        headers={"Cache-Control":"no-store, no-cache, must-revalidate, max-age=0"})
+    except (URLError, HTTPError):
+        return ("cam unreachable", 502)
+
+# ---------- Proxy: stream ----------
+@app.get("/cam.stream")
+def cam_stream():
+    if not CAM_URL:
+        return ("cam no configurada", 400)
+    url = CAM_URL.rstrip("/") + "/stream"
+    try:
+        req = Request(url, headers={"User-Agent":"Mozilla/5.0"})
+        r = urlopen(req, timeout=TIMEOUT)
+    except (URLError, HTTPError):
+        return ("cam unreachable", 502)
+
+    def gen():
+        try:
+            while True:
+                chunk = r.read(8192)
+                if not chunk:
+                    break
+                yield chunk
+        except Exception:
+            pass
+        finally:
+            try: r.close()
+            except: pass
+
+    return Response(stream_with_context(gen()),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control":"no-store, no-cache, must-revalidate, max-age=0"})
+
+# ========== Grabación: hilo que guarda JPGs de /jpg ==========
+def _record_worker():
+    """Descarga /jpg repetidamente y guarda frame_XXXXXX.jpg en REC['dir']."""
+    while not REC["stop_flag"]:
+        if not CAM_URL:
+            REC["error"] = "cam no configurada"
+            break
+        try:
+            # snapshot
+            url = CAM_URL.rstrip("/") + "/jpg"
+            req = Request(url, headers={"User-Agent":"Mozilla/5.0"})
+            with urlopen(req, timeout=TIMEOUT) as r:
+                data = r.read()
+
+            # guarda archivo
+            REC["frames"] += 1
+            fname = f"frame_{REC['frames']:06d}.jpg"
+            with open(os.path.join(REC["dir"], fname), "wb") as f:
+                f.write(data)
+
+            # controla tasa ~ 10-15 fps (ajusta a tu gusto: 50-100ms)
+            time.sleep(0.16)  # 80 ms ≈ ~12.5 fps
+
+        except Exception as e:
+            # si hay un fallo temporal, intenta luego de una pausa corta
+            REC["error"] = str(e)
+            time.sleep(0.3)
+
+    REC["active"] = False
+
+@app.post("/record/start")
+def record_start():
+    if REC["active"]:
+        return jsonify(ok=False, err="ya está grabando", dir=REC["dir"]), 400
+    if not CAM_URL:
+        return jsonify(ok=False, err="cam no configurada"), 400
+
+    base = ensure_dir("recordings")
+    rec_dir = ensure_dir(os.path.join(base, now_dir()))
+    REC.update({
+        "active": True,
+        "dir": rec_dir,
+        "frames": 0,
+        "start_ts": time.time(),
+        "stop_flag": False,
+        "error": None,
+        "thread": None,
+    })
+    th = threading.Thread(target=_record_worker, daemon=True)
+    REC["thread"] = th
+    th.start()
+    return jsonify(ok=True, dir=rec_dir)
+
+@app.post("/record/stop")
+def record_stop():
+    if not REC["active"]:
+        return jsonify(ok=False, err="no estaba grabando"), 400
+    REC["stop_flag"] = True
+    th = REC.get("thread")
+    if th is not None:
+        th.join(timeout=3.0)
+    dur = max(0.001, time.time() - REC["start_ts"])
+    fps = REC["frames"] / dur
+    return jsonify(ok=True, dir=REC["dir"], frames=REC["frames"], seconds=round(dur,2), fps=round(fps,2), err=REC["error"])
+
+@app.get("/record/status")
+def record_status():
+    if not REC["active"]:
+        return jsonify(active=False, dir=REC["dir"], frames=REC["frames"], fps=0)
+    dur = max(0.001, time.time() - REC["start_ts"])
+    fps = REC["frames"] / dur
+    return jsonify(active=True, dir=REC["dir"], frames=REC["frames"], fps=round(fps,2), err=REC["error"])
+
+# ---------- Salud ----------
+@app.get("/health")
+def health():
+    return "ok", 200
+
+# ---------- Catch-all GET -> UI ----------
+@app.route("/<path:_x>", methods=["GET"])
+def catch_all(_x):
+    if _x in ("metrics.json","ingest","set_cam","cam.jpg","cam.stream","record/start","record/stop","record/status","health"):
+        return ("Not Found", 404)
+    return Response(HTML, mimetype="text/html")
+
+if __name__ == "__main__":
+    print("Servidor: http://127.0.0.1:8000/   (o http://<IP_PC>:8000/)")
+    print("UI: Conecta la IP de la cámara, luego usa GRABAR/DETENER.")
+    app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)
