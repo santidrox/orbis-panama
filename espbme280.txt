@@ -1,0 +1,122 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_BME280.h>   
+#include <Adafruit_Sensor.h>
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// WiFi MISMO de la PC que corre hub.py
+const char* SSID = "LICEO TEC";
+const char* PASS = "Liceotec2024*";
+
+// IP de tu PC que corre hub.py
+String HUB = "http://192.168.68.104:8000/ingest"; 
+
+Adafruit_BME280 bme;
+bool isBME280 = false;
+uint8_t i2cAddr = 0x76;
+
+float lastT = NAN, lastH = NAN, lastP = NAN;
+
+bool setupBME(){
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+
+  // escaneo rápido para elegir 0x76/0x77
+  for (uint8_t a : {0x76, 0x77}) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) { i2cAddr = a; break; }
+  }
+
+  // intenta iniciar
+  if (!bme.begin(i2cAddr)) return false;
+
+  // valida chipID (0x60 = BME280; 0x58 = BMP280)
+  uint8_t id = bme.sensorID();
+  isBME280 = (id == 0x60);
+
+  // oversampling moderado para estabilidad y velocidad
+  bme.setSampling(
+    Adafruit_BME280::MODE_FORCED,   // medimos bajo demanda
+    Adafruit_BME280::SAMPLING_X2,   // temp
+    Adafruit_BME280::SAMPLING_X2,   // pres
+    Adafruit_BME280::SAMPLING_X2,   // hum (si BMP, internamente ignora)
+    Adafruit_BME280::FILTER_X4,     // filtro
+    Adafruit_BME280::STANDBY_MS_0_5
+  );
+  return true;
+}
+
+bool sane(float t, float h, float p){
+  // Rango razonable para ambiente
+  if (!(t > -40 && t < 85)) return false;
+  if (isBME280 && !(h >= 0 && h <= 100)) return false;
+  if (!(p > 300 && p < 1100)) return false; // hPa
+  return true;
+}
+
+void setup(){
+  Serial.begin(115200);
+  Serial.println("[BME] Init…");
+  if(!setupBME()){
+    Serial.println("[BME] No se detectó BME280 en 0x76/0x77. ¿Es BMP280? ¿Cableado?");
+  } else {
+    Serial.printf("[BME] OK addr=0x%02X chipID=0x%02X (isBME=%d)\n", i2cAddr, bme.sensorID(), (int)isBME280);
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(SSID, PASS);
+  Serial.printf("[WiFi] Conectando a %s", SSID);
+  while (WiFi.status() != WL_CONNECTED) { Serial.print("."); delay(300); }
+  Serial.printf("\n[WiFi] OK IP=%s\n", WiFi.localIP().toString().c_str());
+}
+
+void loop(){
+  if (WiFi.status() != WL_CONNECTED) { WiFi.reconnect(); delay(500); return; }
+  if (!bme.begin(i2cAddr)) { Serial.println("[BME] Re-init fail"); delay(1000); return; }
+
+  // Modo FORCED: se dispara cada vez
+  bme.takeForcedMeasurement();
+  float t = bme.readTemperature();         // °C
+  float p = bme.readPressure() / 100.0f;   // hPa
+  float h = isBME280 ? bme.readHumidity() : NAN;
+
+  // Sanea/filtra (evita picos 180°C, -100 hPa, etc.)
+  if (!sane(t,h,p)) {
+    Serial.printf("[BME] Lectura inválida t=%.1f h=%.1f p=%.1f\n", t,h,p);
+    delay(3000);
+    return;
+  }
+
+  // Suavizado ligero (opcional)
+  auto smooth = [](float prev, float val, float alpha=0.3f){
+    if (isnan(prev)) return val;
+    return prev + alpha*(val - prev);
+  };
+  lastT = smooth(lastT, t);
+  lastH = isBME280 ? smooth(lastH, h) : NAN;
+  lastP = smooth(lastP, p);
+
+  // Log
+  Serial.printf("[BME] t=%.1f°C  h=%.1f%%  p=%.1f hPa\n", lastT, lastH, lastP);
+
+  // POST al hub
+  HTTPClient http;
+  http.setConnectTimeout(2000);
+  http.begin(HUB);
+  http.addHeader("Content-Type","application/json");
+
+  String payload = "{\"temp\":" + String(lastT,1) +
+                   ",\"humidity\":" + (isnan(lastH)? String("null"): String(lastH,1)) +
+                   ",\"pressure\":" + String(lastP,1) + "}";
+  int code = http.POST(payload);
+  String resp = http.getString();
+  http.end();
+
+  Serial.printf("[POST %d] %s\n", code, resp.c_str());
+
+  delay(3000);
+}
